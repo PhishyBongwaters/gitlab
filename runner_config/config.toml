@@ -7,9 +7,9 @@ shutdown_timeout = 0
 
 [[runners]]
   name = "901bbe8cf525"
-  url = "https://gitlab.nbcc.ca/"
+  url = "https://gitlab.host.com"
   id = 7
-  token = "glrtr-ms82LDFqKsGUDMu35-Hc"
+  token = "TOKEN"
   token_obtained_at = 2026-05-13T18:29:54Z
   token_expires_at = 0001-01-01T00:00:00Z
   tls-ca-file = "/etc/gitlab-runner/certs/ca.crt"
