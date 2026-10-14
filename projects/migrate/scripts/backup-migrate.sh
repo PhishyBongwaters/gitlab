@@ -253,6 +253,26 @@ docker compose -f files/test-migrate.yml down
 info "[Migration] Bring up gitlab-test"
 docker compose -f files/migrate-compose.yml up -d
 
+# The new image's entrypoint reconfigure dies on IrreversibleOrderError
+# (keyset pagination / ApplicationSetting) during cache:clear before
+# migrations run, so the container never becomes ready. Run migrations
+# explicitly first (retry while Postgres comes up), then reconfigure,
+# then wait for readiness.
+info "[Migration] Running DB migrations before readiness check"
+docker exec "$TEST" gitlab-ctl start postgresql || true
+docker exec "$TEST" gitlab-ctl start redis || true
+for i in $(seq 1 12); do
+  if docker exec "$TEST" bash -lc "gitlab-rake db:migrate"; then
+    break
+  fi
+  waitmsg "db:migrate not ready (attempt $i/12), retrying in 10s"
+  sleep 10
+  if [ "$i" -eq 12 ]; then
+    fail "db:migrate failed after 12 attempts"
+  fi
+done
+docker exec "$TEST" gitlab-ctl reconfigure
+
 WAIT_FOR_CONTAINER_READY "$TEST"
 
 # UPGRADE MIGRATION VALIDATION
