@@ -1,0 +1,31 @@
+stages:
+  - migration
+
+run_dr_migrate:
+  stage: migration
+  tags:
+    - host-admin
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: manual
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: on_success
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+    - when: never
+
+  before_script:
+    - echo "Prepping scripts..."
+    - sed -i 's/\r$//' scripts/backup-migrate.sh scripts/cleanup.sh scripts/pre-script.sh
+    - chmod +x scripts/backup-migrate.sh scripts/cleanup.sh scripts/pre-script.sh    
+    - echo "Running pre-script.sh from repository..."
+    - ./scripts/pre-script.sh
+
+  script:
+    - echo "Running migrate script from repository..."
+    - ./scripts/backup-migrate.sh
+
+  after_script:
+    - echo "Running cleanup script from repository..."
+    - if [ "$CI_JOB_STATUS" == "failed" ]; then ./scripts/cleanup.sh; fi

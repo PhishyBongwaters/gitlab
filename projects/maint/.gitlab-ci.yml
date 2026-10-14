@@ -1,0 +1,25 @@
+stages:
+  - maintenance
+
+run_dr_restore:
+  stage: maintenance
+  tags:
+    - host-admin
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      when: manual
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: on_success
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+      when: manual
+    - when: never
+
+  before_script:
+    - sed -i 's/\r$//' scripts/backup-restore.sh
+    - chmod +x scripts/backup-restore.sh
+
+  script:
+    - echo "Running DR restore script from maint repository..."
+    - ./scripts/backup-restore.sh
+

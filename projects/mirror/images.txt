@@ -1,0 +1,24 @@
+# FORMAT: <target-name:tag>=<upstream-ref> 
+# target becomes gitlab.local:5050/<group>/mirror/<target> 
+#
+#  e.g. postgres:production=library/postgres@sha256:a9abf4275f9e99bff8e6aed712b3b7dfec9cac1341bba01c1ffdfce9ff9fc34a
+# 
+alpine:latest=library/alpine:latest
+#####################################
+# ADD CUSTOM IMAGES BELOW THIS LINE #
+
+# LibreChat start ###################
+mongo:8.0.20=library/mongo:8.0.20
+getmeili/meilisearch:v1.35.1=getmeili/meilisearch:v1.35.1
+pgvector/pgvector:0.8.0-pg15-trixie=pgvector/pgvector:0.8.0-pg15-trixie
+librechat-ai/librechat-dev:latest=registry.librechat.ai/librechat-ai/librechat-dev:latest
+danny-avila/librechat-rag-api-dev:latest=registry.librechat.ai/danny-avila/librechat-rag-api-dev:latest
+nginx:1.27.0-alpine=library/nginx:1.27.0-alpine
+ollama/ollama:latest=ollama/ollama:latest
+librechat-admin-panel:latest=registry.librechat.ai/clickhouse/librechat-admin-panel:latest
+
+
+# LibreChat stops ###################
+
+# ADD CUSTOM IMAGES ABOVE THIS LINE #
+#####################################

@@ -1,0 +1,247 @@
+image:
+  name: quay.io/skopeo/stable:latest
+  entrypoint: [""]
+
+stages: [ "mirror" ]
+
+mirror:
+  stage: mirror
+  script:
+    - |
+      set -euo pipefail
+
+      if ! command -v jq >/dev/null; then
+        echo "jq not found, installing..."
+        microdnf -y install jq
+      fi
+
+      ###########################################################################
+      # PART 1 — MIRROR IMAGES
+      ###########################################################################
+
+      expected_images_full_path=$(mktemp)
+
+      if [ ! -f images.txt ]; then
+        echo "images.txt not found"
+        exit 1
+      fi
+
+      while IFS= read -r line; do
+        # Skip blank / comment
+        [ -z "$line" ] && continue
+        case "$line" in \#*) continue ;; esac
+
+        # Normalize CRLF + strip BOM/whitespace
+        clean_line=$(printf "%s" "$line" | tr -d '\r' | sed 's/^[[:space:]\xEF\xBB\xBF]*//;s/[[:space:]]*$//')
+
+        # Split "target=source"
+        target_full="${clean_line%%=*}"
+        source="${clean_line#*=}"
+
+        # Target **must** contain name:tag
+        if ! echo "$target_full" | grep -q ':'; then
+          echo "ERROR: Target '$target_full' must include name:tag"
+          exit 1
+        fi
+
+        target_name="${target_full%%:*}"
+        target_tag="${target_full#*:}"
+
+        # Source MUST contain a slash
+        if ! echo "$source" | grep -q '/'; then
+          echo "ERROR: Source '$source' must contain <repo>/<name>"
+          exit 2
+        fi
+
+        #######################################################################
+        # Upstream detection (digest OR tag)
+        #######################################################################
+        if echo "$source" | grep -q '@sha256:'; then
+          # Digest reference
+          case "$source" in
+            *.*/*@sha256:* ) upstream="$source" ;;     # registry included
+            */*@sha256:* ) upstream="docker.io/${source}" ;; # docker hub shorthand
+            * ) echo "ERROR: Invalid digest format '$source'"; exit 3 ;;
+          esac
+        else
+          # Tag reference
+          if ! echo "$source" | grep -q ':'; then
+            echo "ERROR: Tag missing in '$source'"
+            exit 3
+          fi
+
+          case "$source" in
+            *.*/*:* ) upstream="$source" ;;
+            */*:* ) upstream="docker.io/${source}" ;;
+            * ) echo "ERROR: Invalid tag format '$source'"; exit 3 ;;
+          esac
+        fi
+
+        #######################################################################
+        # Destination ALWAYS uses the target tag provided in images.txt
+        #######################################################################
+        if [ -z "${CI_REGISTRY_IMAGE:-}" ]; then
+          echo "ERROR: CI_REGISTRY_IMAGE is not set"
+          exit 4
+        fi
+
+        src="docker://${upstream}"
+        dest="docker://${CI_REGISTRY_IMAGE}/${target_name}:${target_tag}"
+
+        echo "==> Mirroring ${src} -> ${dest}"
+        
+        skopeo --debug copy \
+          --dest-creds "gitlab-ci-token:${CI_JOB_TOKEN}" \
+          --dest-tls-verify=false \
+          --retry-times 3 \
+          "$src" "$dest"
+
+
+        echo "${CI_REGISTRY_IMAGE}/${target_name}:${target_tag}" >> "${expected_images_full_path}"
+
+      done < images.txt
+
+
+      ###########################################################################
+      # PART 2 — LIST EXISTING REGISTRY IMAGES
+      ###########################################################################
+
+      echo "==> Pruning old images from ${CI_REGISTRY_IMAGE}"
+
+      existing_images_full_path=$(mktemp)
+      existing_tags_meta_path=$(mktemp)
+      deleted_repo_ids_path=$(mktemp)
+
+      REGISTRY_API_URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/registry/repositories"
+      API_AUTH_HEADER="JOB-TOKEN: ${CI_JOB_TOKEN}"
+      [ -n "${GITLAB_TOKEN:-}" ] && API_AUTH_HEADER="PRIVATE-TOKEN: ${GITLAB_TOKEN}"
+
+      page=1
+      while : ; do
+        repos_json=$(curl -k --silent --header "${API_AUTH_HEADER}" "${REGISTRY_API_URL}?per_page=100&page=${page}")
+        [ -z "$(echo "${repos_json}" | jq '.[]')" ] && break
+
+        echo "${repos_json}" | jq -c '.[]' | while read -r repo_json; do
+          repo_id=$(echo "$repo_json" | jq -r '.id')
+          tag_page=1
+
+          while : ; do
+            tags_json=$(curl -k --silent --header "${API_AUTH_HEADER}" \
+              "${REGISTRY_API_URL}/${repo_id}/tags?per_page=100&page=${tag_page}")
+
+            [ -z "$(echo "${tags_json}" | jq '.[]')" ] && break
+
+            echo "$tags_json" | jq -r '.[] | .location' >> "${existing_images_full_path}"
+            echo "$tags_json" | jq -r --arg repo_id "$repo_id" '.[] | [.location, $repo_id, .name] | @tsv' \
+              >> "${existing_tags_meta_path}"
+
+            [ "$(echo "$tags_json" | jq 'length')" -lt 100 ] && break
+            tag_page=$((tag_page + 1))
+          done
+        done
+
+        [ "$(echo "$repos_json" | jq 'length')" -lt 100 ] && break
+        page=$((page + 1))
+      done
+
+
+      ###########################################################################
+      # PART 3 — REMOVE STALE TAGS
+      ###########################################################################
+
+      sort -u -o "${expected_images_full_path}" "${expected_images_full_path}"
+      sort -u -o "${existing_images_full_path}" "${existing_images_full_path}"
+
+      stale_images_full_path=$(mktemp)
+      comm -13 "${expected_images_full_path}" "${existing_images_full_path}" > "${stale_images_full_path}"
+
+      stale_count=$(wc -l < "${stale_images_full_path}" | tr -d ' ')
+      [ "$stale_count" -eq 0 ] && echo "No stale images found."
+
+      while read -r image_to_delete; do
+        [ -z "$image_to_delete" ] && continue
+
+        delete_meta=$(awk -F '\t' -v img="$image_to_delete" '$1==img {print $2 "\t" $3; exit}' "${existing_tags_meta_path}")
+        repo_id=$(printf '%s' "$delete_meta" | cut -f1)
+        tag_name=$(printf '%s' "$delete_meta" | cut -f2)
+
+        [ -z "$repo_id" ] && { echo "Unable to resolve repo for $image_to_delete, skipping."; continue; }
+
+        encoded_tag=$(printf '%s' "$tag_name" | jq -sRr @uri)
+        delete_url="${REGISTRY_API_URL}/${repo_id}/tags/${encoded_tag}"
+
+        delete_body=$(mktemp)
+        delete_status=$(curl -k --silent --output "$delete_body" --write-out "%{http_code}" \
+                        --request DELETE --header "${API_AUTH_HEADER}" "$delete_url")
+
+        case "$delete_status" in
+          200|202|204) echo "Deleted: $image_to_delete" ;;
+          404) echo "Already gone: $image_to_delete" ;;
+          *) echo "Failed to delete $image_to_delete (HTTP $delete_status)"
+             cat "$delete_body"
+             rm -f "$delete_body"
+             exit 5 ;;
+        esac
+
+        echo "$repo_id" >> "${deleted_repo_ids_path}"
+        rm -f "$delete_body"
+
+      done < "${stale_images_full_path}"
+
+      [ "$stale_count" -gt 0 ] && echo "Deleted ${stale_count} stale image tag(s)."
+
+
+      ###########################################################################
+      # PART 4 — REMOVE EMPTY REPOSITORIES
+      ###########################################################################
+
+      if [ -s "${deleted_repo_ids_path}" ]; then
+        sort -u -o "${deleted_repo_ids_path}" "${deleted_repo_ids_path}"
+
+        while read -r repo_id; do
+          [ -z "$repo_id" ] && continue
+
+          tags_check=$(curl -k --silent --header "${API_AUTH_HEADER}" \
+                        "${REGISTRY_API_URL}/${repo_id}/tags?per_page=1")
+
+          if [ -z "$(echo "$tags_check" | jq '.[]')" ]; then
+            repo_delete_body=$(mktemp)
+            repo_delete_status=$(curl -k --silent --output "$repo_delete_body" \
+                                --write-out "%{http_code}" \
+                                --request DELETE --header "${API_AUTH_HEADER}" \
+                                "${REGISTRY_API_URL}/${repo_id}")
+
+            case "$repo_delete_status" in
+              200|202|204) echo "Deleted empty repository id=$repo_id" ;;
+              404) echo "Repository id=$repo_id already removed" ;;
+              *) echo "Failed to delete repo id=$repo_id (HTTP $repo_delete_status)"
+                 cat "$repo_delete_body"
+                 rm -f "$repo_delete_body"
+                 exit 6 ;;
+            esac
+
+            rm -f "$repo_delete_body"
+          fi
+        done < "${deleted_repo_ids_path}"
+      fi
+
+
+      ###########################################################################
+      # CLEANUP
+      ###########################################################################
+
+      rm -f "${expected_images_full_path}" \
+            "${existing_images_full_path}" \
+            "${existing_tags_meta_path}" \
+            "${stale_images_full_path}" \
+            "${deleted_repo_ids_path}"
+
+      echo "==> Pruning complete."
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+      changes:
+        - images.txt
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'
+  tags: [ "devops" ]

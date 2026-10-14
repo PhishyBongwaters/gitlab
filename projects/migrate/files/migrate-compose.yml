@@ -1,0 +1,51 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  gitlab-test:
+    logging: *default-logging
+    image: '${GITLAB_MIGRATE_IMAGE}'
+    container_name: 'gitlab-test'
+    restart: unless-stopped
+    hostname: 'gitlab-test.local'
+    extra_hosts:
+      - "gitlab-test.local:127.0.0.1"
+
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'https://${GITLAB_HOST}'
+        nginx['ssl_certificate'] = '/etc/gitlab/ssl/gitlab-test.local.crt'
+        nginx['ssl_certificate_key'] = '/etc/gitlab/ssl/gitlab-test.local.key'
+        nginx['redirect_http_to_https'] = false   
+
+        # Registry Settings
+        letsencrypt['enable'] = false
+        letsencrypt['auto_renew'] = false
+        
+        gitlab_rails['registry_enabled'] = false
+        gitlab_rails['omniauth_enabled'] = false
+        redis['enable'] = true       
+
+    ports:
+      - '8081:80'  
+      - '8444:443' 
+      - '2224:22'     
+      - '5006:5005'
+
+    volumes:    
+      - gitlab-test-data:/var/opt/gitlab
+      - ${CI_PROJECT_DIR}/files/certs/cert.pem:/etc/gitlab/ssl/gitlab-test.local.crt:ro
+      - ${CI_PROJECT_DIR}/files/certs/key.pem:/etc/gitlab/ssl/gitlab-test.local.key:ro
+    
+    healthcheck:
+      test: ["CMD-SHELL", "curl -k -fsS https://localhost:443/-/readiness || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s      
+
+volumes:
+  gitlab-test-data:
