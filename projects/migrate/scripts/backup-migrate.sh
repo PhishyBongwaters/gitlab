@@ -186,15 +186,9 @@ WAIT_FOR_SERVICES
 
 info "[8/10] Setting root password"
 
-docker exec "$TEST" bash -c \
-"NEW_ROOT_PASSWORD=${ROOT_PASSWORD}
-u = User.find_by_username('root')
-if u
-  u.password = ENV['NEW_ROOT_PASSWORD']
-  u.password_confirmation = ENV['NEW_ROOT_PASSWORD']
-  u.save!
-end
-RUBY"
+# Use gitlab-rails runner (not bash -c with Ruby) and pass the password
+# via docker exec -e so it never appears in the command line.
+docker exec -e NEW_ROOT_PASSWORD="$ROOT_PASSWORD" "$TEST" gitlab-rails runner "u = User.find_by_username('root'); if u; u.password = ENV['NEW_ROOT_PASSWORD']; u.password_confirmation = ENV['NEW_ROOT_PASSWORD']; u.save!; end"
 
 # CANCEL RESTORED PIPELINES
 
