@@ -9,7 +9,7 @@ PROD="${PROD:-gitlab}"
 TEST="${TEST:-gitlab-test}"
 BACKUP_DIR="${BACKUP_DIR:-./backups}"
 MAX_WAIT="${MAX_WAIT:-600}"
-ROOT_PASSWORD="${ROOT_PASSWORD:-Test123!}"
+ROOT_PASSWORD="${ROOT_PASSWORD:-}"  # Set via CI variable; hardcoded test password removed
 
 ###############################################################################
 # LOGGING
@@ -18,6 +18,9 @@ ROOT_PASSWORD="${ROOT_PASSWORD:-Test123!}"
 fail()  { echo "$1" >&2; exit 1; }
 info()  { echo -e "\n=== $1 ==="; }
 ok()    { echo "$1"; }
+
+# Fail fast if the required test password was not provided via CI variables.
+[[ -n "${ROOT_PASSWORD:-}" ]] || fail "ROOT_PASSWORD must be set (CI variable)"
 waitmsg(){ echo "… $1"; }
 
 # WAIT HELPERS
@@ -148,12 +151,20 @@ docker cp "$BACKUP_DIR/$LATEST" "$TEST:/var/opt/gitlab/backups/$LATEST"
 docker exec "$TEST" chown git:git "/var/opt/gitlab/backups/$LATEST"
 docker exec "$TEST" chmod 600 "/var/opt/gitlab/backups/$LATEST"
 
+# Delete intermediate host copy: PROD -> ./backups -> TEST held 3 copies
+# of the same backup on the same disk. Keep only PROD + TEST during restore.
+rm -f "$BACKUP_DIR/$LATEST"
+
 # RESTORE BACKUP
 
 info "[5/10] Running GitLab restore"
 
 docker exec -i "$TEST" sh -c \
   "yes yes | gitlab-backup restore BACKUP='$STAMP'"
+
+# Delete TEST backup copy after restore: no longer needed, frees volume
+# space before reconfigure/restart.
+docker exec "$TEST" rm -f "/var/opt/gitlab/backups/$LATEST"
 
 # RECONFIGURE
 
@@ -173,7 +184,7 @@ WAIT_FOR_SERVICES
 info "[8/10] Setting root password"
 
 docker exec "$TEST" bash -c \
-"NEW_ROOT_PASSWORD=\"$ROOT_PASSWORD\" gitlab-rails runner - <<'RUBY' 2>/dev/null
+"NEW_ROOT_PASSWORD=${ROOT_PASSWORD}
 u = User.find_by_username('root')
 if u
   u.password = ENV['NEW_ROOT_PASSWORD']
