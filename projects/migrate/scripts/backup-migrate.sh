@@ -9,6 +9,9 @@ PROD="${PROD:-gitlab}"
 TEST="${TEST:-gitlab-test}"
 BACKUP_DIR="${BACKUP_DIR:-./backups}"
 MAX_WAIT="${MAX_WAIT:-600}"
+# Skip registry blobs in test backups: registry is what blows the backup
+# to 9.2G. Set BACKUP_SKIP="" in CI for a full backup.
+BACKUP_SKIP="${BACKUP_SKIP:-registry}"
 ROOT_PASSWORD="${ROOT_PASSWORD:-}"  # Set via CI variable; hardcoded test password removed
 
 ###############################################################################
@@ -112,7 +115,7 @@ info "PROD projects w/ repos: $PROD_WITH_REPOS"
 # CREATE FULL BACKUP ON PROD
 info "[2/10] Creating FULL backup on $PROD"
 
-docker exec "$PROD" gitlab-backup create
+docker exec "$PROD" gitlab-backup create SKIP="$BACKUP_SKIP"
 
 LATEST=$(docker exec "$PROD" bash -c \
   "ls -1 /var/opt/gitlab/backups/*.tar | sort | tail -n1 | xargs basename" \
@@ -160,7 +163,7 @@ rm -f "$BACKUP_DIR/$LATEST"
 info "[5/10] Running GitLab restore"
 
 docker exec -i "$TEST" sh -c \
-  "yes yes | gitlab-backup restore BACKUP='$STAMP'"
+  "yes yes | gitlab-backup restore BACKUP='$STAMP' SKIP='$BACKUP_SKIP'"
 
 # Delete TEST backup copy after restore: no longer needed, frees volume
 # space before reconfigure/restart.
