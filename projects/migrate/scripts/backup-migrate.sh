@@ -9,7 +9,10 @@ PROD="${PROD:-gitlab}"
 TEST="${TEST:-gitlab-test}"
 BACKUP_DIR="${BACKUP_DIR:-./backups}"
 MAX_WAIT="${MAX_WAIT:-600}"
-ROOT_PASSWORD="${ROOT_PASSWORD:-Test123!}"
+# Skip registry blobs in test backups: registry is what blows the backup
+# to 9.2G. Set BACKUP_SKIP="" in CI for a full backup.
+BACKUP_SKIP="${BACKUP_SKIP:-registry}"
+ROOT_PASSWORD="${ROOT_PASSWORD:-}"  # Set via CI variable; hardcoded test password removed
 
 ###############################################################################
 # LOGGING
@@ -18,6 +21,9 @@ ROOT_PASSWORD="${ROOT_PASSWORD:-Test123!}"
 fail()  { echo "$1" >&2; exit 1; }
 info()  { echo -e "\n=== $1 ==="; }
 ok()    { echo "$1"; }
+
+# Fail fast if the required test password was not provided via CI variables.
+[[ -n "${ROOT_PASSWORD:-}" ]] || fail "ROOT_PASSWORD must be set (CI variable)"
 waitmsg(){ echo "… $1"; }
 
 # WAIT HELPERS
@@ -90,7 +96,7 @@ else
 fi
 
 # PROD READINESS + METRICS
-info "[1/10] Capturing PROD data metrics"
+info "[1/13] Capturing PROD data metrics"
 
 WAIT_FOR_CONTAINER_READY "$PROD"
 
@@ -107,9 +113,9 @@ info "PROD projects w/ repos: $PROD_WITH_REPOS"
   || fail "PROD project count is zero — aborting"
 
 # CREATE FULL BACKUP ON PROD
-info "[2/10] Creating FULL backup on $PROD"
+info "[2/13] Creating FULL backup on $PROD"
 
-docker exec "$PROD" gitlab-backup create
+docker exec "$PROD" gitlab-backup create SKIP="$BACKUP_SKIP"
 
 LATEST=$(docker exec "$PROD" bash -c \
   "ls -1 /var/opt/gitlab/backups/*.tar | sort | tail -n1 | xargs basename" \
@@ -128,7 +134,7 @@ info "Using backup: $LATEST"
 
 #WAIT_FOR_CONTAINER_READY "$TEST"
 
-info "[3/10] Preparing $TEST for restore"
+info "[3/13] Preparing $TEST for restore"
 
 docker exec "$TEST" gitlab-ctl stop puma || true
 docker exec "$TEST" gitlab-ctl stop sidekiq || true
@@ -140,7 +146,7 @@ sleep 5
 
 # COPY BACKUP TO TEST
 
-info "[4/10] Preparing backup on $TEST"
+info "[4/13] Preparing backup on $TEST"
 
 docker exec "$TEST" mkdir -p /var/opt/gitlab/backups
 docker cp "$BACKUP_DIR/$LATEST" "$TEST:/var/opt/gitlab/backups/$LATEST"
@@ -148,43 +154,45 @@ docker cp "$BACKUP_DIR/$LATEST" "$TEST:/var/opt/gitlab/backups/$LATEST"
 docker exec "$TEST" chown git:git "/var/opt/gitlab/backups/$LATEST"
 docker exec "$TEST" chmod 600 "/var/opt/gitlab/backups/$LATEST"
 
+# Delete intermediate host copy: PROD -> ./backups -> TEST held 3 copies
+# of the same backup on the same disk. Keep only PROD + TEST during restore.
+rm -f "$BACKUP_DIR/$LATEST"
+
 # RESTORE BACKUP
 
-info "[5/10] Running GitLab restore"
+info "[5/13] Running GitLab restore"
 
 docker exec -i "$TEST" sh -c \
-  "yes yes | gitlab-backup restore BACKUP='$STAMP'"
+  "yes yes | gitlab-backup restore BACKUP='$STAMP' SKIP='$BACKUP_SKIP'"
+
+# Delete TEST backup copy after restore: no longer needed, frees volume
+# space before reconfigure/restart.
+docker exec "$TEST" rm -f "/var/opt/gitlab/backups/$LATEST"
 
 # RECONFIGURE
 
-info "[6/10] Reconfiguring GitLab after restore"
+info "[6/13] Reconfiguring GitLab after restore"
 
 docker exec "$TEST" gitlab-ctl reconfigure
 
 # RESTART
 
-info "[7/10] Restarting GitLab"
+info "[7/13] Restarting GitLab"
 
 docker exec "$TEST" gitlab-ctl restart
 WAIT_FOR_SERVICES
 
 # RESET ROOT PASSWORD
 
-info "[8/10] Setting root password"
+info "[8/13] Setting root password"
 
-docker exec "$TEST" bash -c \
-"NEW_ROOT_PASSWORD=\"$ROOT_PASSWORD\" gitlab-rails runner - <<'RUBY' 2>/dev/null
-u = User.find_by_username('root')
-if u
-  u.password = ENV['NEW_ROOT_PASSWORD']
-  u.password_confirmation = ENV['NEW_ROOT_PASSWORD']
-  u.save!
-end
-RUBY"
+# Use gitlab-rails runner (not bash -c with Ruby) and pass the password
+# via docker exec -e so it never appears in the command line.
+docker exec -e NEW_ROOT_PASSWORD="$ROOT_PASSWORD" "$TEST" gitlab-rails runner "u = User.find_by_username('root'); if u; u.password = ENV['NEW_ROOT_PASSWORD']; u.password_confirmation = ENV['NEW_ROOT_PASSWORD']; u.save!; end"
 
 # CANCEL RESTORED PIPELINES
 
-info "[9/10] Cleaning up restored pipelines"
+info "[9/13] Cleaning up restored pipelines"
 
 docker exec "$TEST" gitlab-rails runner - <<'RUBY' 2>/dev/null
 begin
@@ -200,7 +208,7 @@ RUBY
 
 WAIT_FOR_CONTAINER_READY "$TEST"
 
-info "[10/10] Validating restored data integrity"
+info "[10/13] Validating restored data integrity"
 
 TEST_PROJECTS=$(docker exec "$TEST" bash -lc \
   "gitlab-rails runner \"puts Project.count\" 2>/dev/null")
@@ -220,11 +228,11 @@ info "TEST projects w/ repos: $TEST_WITH_REPOS"
 ok "Data integrity validated"
 ok "RESTORE SUCCESS — GitLab-test is verified and healthy"
 
-info "[CLEANUP] Pruning backups"
+info "[11/13] Pruning backups"
 docker exec "$PROD" bash -c "ls -1t /var/opt/gitlab/backups/*.tar | tail -n +2 | xargs -r rm -f"
 
 # MIGRATION VALIDATION
-info "[PRE-CLEANUP] Validating database migrations"
+info "[11/13] Validating database migrations (19.4.1)"
 
 FAILED_MIGRATIONS=$(
   docker exec "$TEST" bash -lc "gitlab-rake db:migrate:status" \
@@ -239,16 +247,36 @@ ok "Upgrade validation OK: no pending migrations"
 
 
 # Swap container images via compose files
-info "[CLEANUP] Take down gitlab-test"
+info "[12/13] Take down gitlab-test (before upgrade)"
 docker compose -f files/test-migrate.yml down 
 
-info "[Migration] Bring up gitlab-test"
+info "[12/13] Bring up gitlab-test (latest)"
 docker compose -f files/migrate-compose.yml up -d
+
+# The new image's entrypoint reconfigure dies on IrreversibleOrderError
+# (keyset pagination / ApplicationSetting) during cache:clear before
+# migrations run, so the container never becomes ready. Run migrations
+# explicitly first (retry while Postgres comes up), then reconfigure,
+# then wait for readiness.
+info "[12/13] Running DB migrations before readiness check"
+docker exec "$TEST" gitlab-ctl start postgresql || true
+docker exec "$TEST" gitlab-ctl start redis || true
+for i in $(seq 1 12); do
+  if docker exec "$TEST" bash -lc "gitlab-rake db:migrate"; then
+    break
+  fi
+  waitmsg "db:migrate not ready (attempt $i/12), retrying in 10s"
+  sleep 10
+  if [ "$i" -eq 12 ]; then
+    fail "db:migrate failed after 12 attempts"
+  fi
+done
+docker exec "$TEST" gitlab-ctl reconfigure
 
 WAIT_FOR_CONTAINER_READY "$TEST"
 
 # UPGRADE MIGRATION VALIDATION
-info "[Migration] Validating database migrations"
+info "[13/13] Validating database migrations"
 
 FAILED_MIGRATIONS=$(
   docker exec "$TEST" bash -lc "gitlab-rake db:migrate:status" \
@@ -259,9 +287,9 @@ if (( FAILED_MIGRATIONS > 0 )); then
   fail "Upgrade validation FAILED: $FAILED_MIGRATIONS pending migrations"
 fi
 
-ok "[Migration] Migrations complete"
+ok "[13/13] Migrations complete"
 
-info "[CLEANUP] Take down gitlab-test"
+info "[13/13] Take down gitlab-test"
 docker compose -f files/migrate-compose.yml down -v
 docker volume prune -f
 

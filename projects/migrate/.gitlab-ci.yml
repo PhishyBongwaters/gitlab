@@ -6,6 +6,21 @@ run_dr_migrate:
   tags:
     - host-admin
 
+  variables:
+    # Preflight in pre-script.sh fails fast if free disk is below this.
+    # Migration holds ~3 backup copies at once on the same disk.
+    MIN_FREE_GB: "20"
+
+  artifacts:
+    # Logs captured by cleanup.sh before teardown on failure.
+    when: on_failure
+    expire_in: 1 week
+    paths:
+      - gitlab-test.log
+      - disk-before-cleanup.log
+      - docker-system-df.log
+      - test-migrate.log
+
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push"'
       when: manual
